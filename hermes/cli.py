@@ -1021,27 +1021,43 @@ def scrape_title(
 
         state_upper = state.upper()
 
-        if is_promulgated_state(state_upper):
-            # Promulgated state — load directly
+        # ── Dispatch to state-specific loaders ──
+        _STATE_LOADERS = {
+            "TX": ("hermes.scraper.tdi_scraper", "load_tx_promulgated_rates", "TDI Basic Manual", True),
+            "FL": ("hermes.scraper.state_title_rates", "load_fl_promulgated_rates", "Florida OIR", True),
+            "NM": ("hermes.scraper.state_title_rates", "load_nm_promulgated_rates", "NM OSI", True),
+            "NY": ("hermes.scraper.state_title_rates", "load_ny_filed_rates", "NY DFS (filed)", False),
+            "CA": ("hermes.scraper.state_title_rates", "load_ca_filed_rates", "CA CDI (filed)", False),
+        }
+
+        if state_upper in _STATE_LOADERS:
+            module_path, func_name, source_label, promulgated = _STATE_LOADERS[state_upper]
+
+            import importlib
+            mod = importlib.import_module(module_path)
+            loader_fn = getattr(mod, func_name)
+
+            rate_type = "promulgated" if promulgated else "filed"
             console.print(
-                f"[yellow]{state_upper} has promulgated title rates — loading directly[/yellow]"
+                f"[yellow]{state_upper} has {rate_type} title rates — loading directly[/yellow]"
             )
-            if state_upper == "TX":
-                from hermes.scraper.tdi_scraper import load_tx_promulgated_rates
 
-                with console.status(f"[bold green]Loading {state_upper} promulgated rates...[/bold green]"):
-                    results = _run(load_tx_promulgated_rates())
+            with console.status(f"[bold green]Loading {state_upper} {rate_type} rates...[/bold green]"):
+                results = _run(loader_fn())
 
-                table = Table(title=f"TX Promulgated Rates Loaded", box=box.ROUNDED)
-                table.add_column("Metric", style="cyan")
-                table.add_column("Value", style="green", justify="right")
-                table.add_row("Rate Cards Created", str(len(results)))
-                table.add_row("Source", "TDI Basic Manual")
-                console.print(table)
-            else:
-                console.print(f"[yellow]Promulgated rate loader for {state_upper} not yet implemented[/yellow]")
+            table = Table(title=f"{state_upper} Title Rates Loaded", box=box.ROUNDED)
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", style="green", justify="right")
+            table.add_row("Rate Cards Created", str(len(results)))
+            table.add_row("Rate Type", "Promulgated" if promulgated else "Filed (per-carrier)")
+            table.add_row("Source", source_label)
+            console.print(table)
+
+        elif is_promulgated_state(state_upper):
+            console.print(f"[yellow]Promulgated rate loader for {state_upper} not yet implemented[/yellow]")
+
         else:
-            # Non-promulgated — SERFF search
+            # Non-promulgated, no built-in loader — SERFF search
             from hermes.scraper.title_search import build_title_search_params
             from hermes.tasks import _get_scraper_for_state
 
