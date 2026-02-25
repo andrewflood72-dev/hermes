@@ -1,14 +1,46 @@
-venv/
+# Python
 __pycache__/
-*.pyc
-.env
+*.py[cod]
 *.egg-info/
-data/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
 *.log
-*.png
-*.html
-*.json
-!pyproject.toml
-!scripts/**
-!hermes/**
-!migrations/**
+
+# Debug / probe scripts
+probe_*.py
+debug_*.py
+test_serff_*.py
+
+# SERFF scraping artifacts (screenshots, HTML dumps, raw JSON)
+fl_*.png
+serff_*.png
+serff_*.html
+serff_*.json
+
+# Scraped data directory
+data/
+
+# Scrape output logs (already covered by *.log)
+# scrape_*.log
