@@ -117,6 +117,12 @@ class Carrier(Base):
     rankings: Mapped[List["CarrierRanking"]] = relationship(
         "CarrierRanking", back_populates="carrier"
     )
+    pmi_rate_cards: Mapped[List["PMIRateCard"]] = relationship(
+        "PMIRateCard", back_populates="carrier"
+    )
+    pmi_serff_data: Mapped[List["PMISERFFData"]] = relationship(
+        "PMISERFFData", back_populates="carrier"
+    )
 
 
 class CarrierLicense(Base):

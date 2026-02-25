@@ -716,3 +716,183 @@ async def _health_check_async() -> dict:
         )
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# Task 8: scrape_title_filings
+# ---------------------------------------------------------------------------
+
+
+@app.task(
+    name="hermes.tasks.scrape_title_filings",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=300,
+    queue="scraper",
+)
+def scrape_title_filings(self: Task) -> dict:
+    """Scrape title insurance filings from SERFF and state DOI portals.
+
+    For promulgated states (TX, NM), loads state-set rates directly.
+    For other states, runs SERFF title-specific search.
+
+    Returns:
+        Dict with ``states_scraped``, ``rate_cards_loaded``, and ``errors``.
+    """
+    logger.info("Task: scrape_title_filings started")
+    return _run_async(_scrape_title_filings_async())
+
+
+async def _scrape_title_filings_async() -> dict:
+    """Async implementation of the title filing scrape task."""
+    from hermes.scraper.title_search import (
+        build_title_search_params,
+        is_promulgated_state,
+    )
+
+    summary = {
+        "states_scraped": 0,
+        "rate_cards_loaded": 0,
+        "filings_found": 0,
+        "errors": [],
+    }
+
+    # Get scrape-enabled states
+    async with async_session() as session:
+        stmt = text(
+            "SELECT state FROM hermes_state_config "
+            "WHERE scrape_enabled = TRUE "
+            "ORDER BY tier ASC, state ASC"
+        )
+        result = await session.execute(stmt)
+        state_configs = result.fetchall()
+
+    for sc in state_configs:
+        state = sc.state
+        try:
+            if is_promulgated_state(state):
+                if state == "TX":
+                    from hermes.scraper.tdi_scraper import load_tx_promulgated_rates
+                    results = await load_tx_promulgated_rates()
+                    summary["rate_cards_loaded"] += len(results)
+                # Add other promulgated states as implemented
+            else:
+                params = build_title_search_params(state)
+                if params is None:
+                    continue
+
+                scraper = _get_scraper_for_state(state)
+                if scraper is None:
+                    continue
+
+                scrape_result = await scraper.scrape(params)
+                summary["filings_found"] += scrape_result.filings_found
+                if scrape_result.errors:
+                    summary["errors"].extend(scrape_result.errors[:3])
+
+            summary["states_scraped"] += 1
+
+        except Exception as exc:
+            msg = f"Title scrape error state={state}: {exc}"
+            logger.error(msg)
+            summary["errors"].append(msg)
+
+    logger.info(
+        "scrape_title_filings complete: states=%d rate_cards=%d errors=%d",
+        summary["states_scraped"],
+        summary["rate_cards_loaded"],
+        len(summary["errors"]),
+    )
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Task 9: parse_title_filings
+# ---------------------------------------------------------------------------
+
+
+@app.task(
+    name="hermes.tasks.parse_title_filings",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=120,
+    queue="parser",
+)
+def parse_title_filings(self: Task) -> dict:
+    """Parse all unparsed title insurance filing documents.
+
+    Finds documents from title insurance filings that haven't been parsed,
+    runs them through the TitleParser, and stores structured rate data.
+
+    Returns:
+        Dict with ``documents_parsed``, ``documents_failed``, and ``errors``.
+    """
+    logger.info("Task: parse_title_filings started")
+    return _run_async(_parse_title_filings_async())
+
+
+async def _parse_title_filings_async() -> dict:
+    """Async implementation of the title filing parse task."""
+    from hermes.parsers.title_parser import TitleParser
+
+    summary = {"documents_parsed": 0, "documents_failed": 0, "errors": []}
+
+    # Fetch unparsed title filing documents
+    async with async_session() as session:
+        stmt = text(
+            """
+            SELECT fd.id, fd.file_path, fd.document_type
+            FROM hermes_filing_documents fd
+            JOIN hermes_filings f ON f.id = fd.filing_id
+            WHERE fd.parsed_flag = FALSE
+              AND fd.file_path IS NOT NULL
+              AND f.line_of_business ILIKE '%title%'
+            ORDER BY fd.created_at ASC
+            LIMIT 100
+            """
+        )
+        result = await session.execute(stmt)
+        docs = result.fetchall()
+
+    logger.info("Found %d unparsed title documents", len(docs))
+
+    title_parser = TitleParser()
+
+    for doc in docs:
+        try:
+            parse_result = await title_parser.parse(doc.id, doc.file_path)
+
+            if parse_result.status in ("completed", "partial"):
+                async with async_session() as session:
+                    await session.execute(
+                        text(
+                            "UPDATE hermes_filing_documents "
+                            "SET parsed_flag = TRUE, "
+                            "    parse_confidence = :confidence, "
+                            "    parse_version = :version, "
+                            "    updated_at = NOW() "
+                            "WHERE id = :doc_id"
+                        ),
+                        {
+                            "doc_id": str(doc.id),
+                            "confidence": parse_result.confidence_avg,
+                            "version": "1.0",
+                        },
+                    )
+                    await session.commit()
+                summary["documents_parsed"] += 1
+            else:
+                summary["documents_failed"] += 1
+
+        except Exception as exc:
+            msg = f"Title parse error doc={doc.id}: {exc}"
+            logger.error(msg)
+            summary["errors"].append(msg)
+            summary["documents_failed"] += 1
+
+    logger.info(
+        "parse_title_filings complete: parsed=%d failed=%d",
+        summary["documents_parsed"],
+        summary["documents_failed"],
+    )
+    return summary

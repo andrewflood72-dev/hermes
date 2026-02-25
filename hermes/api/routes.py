@@ -26,7 +26,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -45,6 +45,12 @@ from hermes.api.schemas import (
 )
 from hermes.config import settings
 from hermes.matching.engine import CarrierMatchResult, MatchingEngine
+from hermes.mga.agent import MGAProposalAgent
+from hermes.mga.routes import router as mga_router, set_mga_agent, set_db_engine as set_mga_db_engine
+from hermes.pmi.engine import HermesPMIEngine
+from hermes.pmi.routes import router as pmi_router, set_pmi_engine, set_db_engine as set_pmi_db_engine
+from hermes.title.engine import HermesTitleEngine
+from hermes.title.routes import router as title_router, set_title_engine, set_db_engine as set_title_db_engine
 
 logger = logging.getLogger("hermes.api")
 
@@ -84,6 +90,9 @@ def _check_rate_limit(api_key: str) -> None:
 
 _engine: AsyncEngine | None = None
 _matching_engine: MatchingEngine | None = None
+_pmi_engine: HermesPMIEngine | None = None
+_title_engine: HermesTitleEngine | None = None
+_mga_agent: MGAProposalAgent | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     On startup: creates the database engine and initialises the
     :class:`MatchingEngine`.  On shutdown: disposes the connection pool.
     """
-    global _engine, _matching_engine
+    global _engine, _matching_engine, _pmi_engine, _title_engine, _mga_agent
 
     logger.info("Hermes API starting up (version=%s)", __version__)
 
@@ -111,9 +120,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _matching_engine = MatchingEngine(db_engine=_engine)
     logger.info("MatchingEngine ready")
 
+    _pmi_engine = HermesPMIEngine(db_engine=_engine)
+    set_pmi_engine(_pmi_engine)
+    set_pmi_db_engine(_engine)
+    logger.info("HermesPMIEngine ready")
+
+    _title_engine = HermesTitleEngine(db_engine=_engine)
+    set_title_engine(_title_engine)
+    set_title_db_engine(_engine)
+    logger.info("HermesTitleEngine ready")
+
+    _mga_agent = MGAProposalAgent(
+        db_engine=_engine, pmi_engine=_pmi_engine, title_engine=_title_engine
+    )
+    set_mga_agent(_mga_agent)
+    set_mga_db_engine(_engine)
+    logger.info("MGAProposalAgent ready")
+
     yield  # ← application runs here
 
     logger.info("Hermes API shutting down")
+    if _mga_agent is not None:
+        await _mga_agent.close()
+    if _title_engine is not None:
+        await _title_engine.close()
+    if _pmi_engine is not None:
+        await _pmi_engine.close()
     if _matching_engine is not None:
         await _matching_engine.close()
     if _engine is not None:
@@ -146,6 +178,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include sub-routers
+app.include_router(pmi_router)
+app.include_router(title_router)
+app.include_router(mga_router)
+
 
 # ---------------------------------------------------------------------------
 # Middleware — request logging
@@ -166,6 +203,91 @@ async def log_requests(request: Request, call_next):
         elapsed_ms,
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# Homepage — proposal dashboard (no auth required)
+# ---------------------------------------------------------------------------
+
+_HOME_CSS = """\
+:root { --primary: #1a365d; --accent: #2b6cb0; --bg: #f7fafc; --text: #1a202c; --muted: #718096; --border: #e2e8f0; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); }
+.shell { max-width: 1000px; margin: 0 auto; padding: 40px 32px; }
+header { text-align: center; margin-bottom: 48px; }
+header h1 { font-family: Georgia, serif; font-size: 2rem; color: var(--primary); }
+header p { color: var(--muted); margin-top: 8px; }
+.card { background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 28px 32px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06); transition: box-shadow .15s; }
+.card:hover { box-shadow: 0 4px 12px rgba(0,0,0,.1); }
+.card h2 { font-size: 1.25rem; color: var(--primary); margin-bottom: 6px; }
+.card .meta { color: var(--muted); font-size: .85rem; margin-bottom: 16px; }
+.card .meta span { margin-right: 16px; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.badge-complete { background: #c6f6d5; color: #276749; }
+.badge-draft { background: #fefcbf; color: #975a16; }
+.badge-error { background: #fed7d7; color: #9b2c2c; }
+.actions { display: flex; gap: 12px; }
+.btn { display: inline-block; padding: 9px 22px; border-radius: 6px; font-size: .88rem; font-weight: 600; text-decoration: none; transition: background .15s; }
+.btn-view { background: var(--primary); color: #fff; }
+.btn-view:hover { background: var(--accent); }
+.btn-pdf { background: #fff; color: var(--primary); border: 2px solid var(--primary); }
+.btn-pdf:hover { background: var(--primary); color: #fff; }
+.empty { text-align: center; color: var(--muted); padding: 60px 0; font-size: 1.1rem; }
+"""
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def homepage() -> HTMLResponse:
+    """Landing page listing all MGA proposals with view/download links."""
+    engine = _get_engine()
+    query = text("""
+        SELECT id, program_type, title, status, generated_by, created_at
+        FROM hermes_mga_proposals
+        ORDER BY created_at DESC
+        LIMIT 50
+    """)
+    async with engine.connect() as conn:
+        rows = (await conn.execute(query)).mappings().all()
+
+    cards = ""
+    for r in rows:
+        pid = r["id"]
+        title = r["title"] or "Untitled Proposal"
+        st = r["status"] or "draft"
+        badge_cls = {"complete": "badge-complete", "error": "badge-error"}.get(st, "badge-draft")
+        created = r["created_at"]
+        date_str = created.strftime("%B %d, %Y at %I:%M %p") if hasattr(created, "strftime") else str(created)
+        prog = (r["program_type"] or "").upper()
+        cards += (
+            f'<div class="card">'
+            f'<h2>{title}</h2>'
+            f'<div class="meta">'
+            f'<span class="badge {badge_cls}">{st}</span>'
+            f"<span>{prog}</span>"
+            f"<span>{date_str}</span>"
+            f"</div>"
+            f'<div class="actions">'
+            f'<a class="btn btn-view" href="/v1/mga/proposals/{pid}/view">View Proposal</a>'
+            f'<a class="btn btn-pdf" href="/v1/mga/proposals/{pid}/pdf">Download PDF</a>'
+            f"</div>"
+            f"</div>"
+        )
+
+    if not cards:
+        cards = '<div class="empty">No proposals yet. Generate one via <code>POST /v1/mga/proposal</code>.</div>'
+
+    html = (
+        "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Hermes — MGA Proposals</title>"
+        f"<style>{_HOME_CSS}</style></head><body>"
+        '<div class="shell">'
+        "<header><h1>Hermes MGA Proposals</h1>"
+        "<p>Regulatory intelligence &amp; MGA proposal engine</p></header>"
+        f"{cards}"
+        "</div></body></html>"
+    )
+    return HTMLResponse(content=html)
 
 
 # ---------------------------------------------------------------------------

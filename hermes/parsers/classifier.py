@@ -35,6 +35,7 @@ DOCUMENT_TYPES = (
     "application",
     "schedule",
     "supporting",
+    "title_rate",
 )
 
 # ── Filename pattern rules ─────────────────────────────────────────────────
@@ -42,6 +43,16 @@ DOCUMENT_TYPES = (
 # (pattern_regex, document_type).
 
 _FILENAME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Title-specific patterns (must be before generic rate patterns)
+    (re.compile(r"\btitle[_ ]?rate\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\btitle[_ ]?manual\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\bbasic[_ ]?manual\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\bsimultaneous[_ ]?issue\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\breissue[_ ]?rate\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\btitle[_ ]?insurance\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\bowner[_ ]?policy[_ ]?rate\b", re.IGNORECASE), "title_rate"),
+    (re.compile(r"\blender[_ ]?policy[_ ]?rate\b", re.IGNORECASE), "title_rate"),
+    # Standard P&C patterns
     (re.compile(r"\brate[_ ]?exhibit\b", re.IGNORECASE), "rate_exhibit"),
     (re.compile(r"\brate[_ ]?table\b", re.IGNORECASE), "rate_exhibit"),
     (re.compile(r"\bilf\b", re.IGNORECASE), "rate_exhibit"),
@@ -61,6 +72,13 @@ _FILENAME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # ── First-page keyword rules ───────────────────────────────────────────────
 
 _KEYWORD_RULES: list[tuple[list[str], str]] = [
+    # Title-specific keywords (must be before generic rate keywords)
+    (
+        ["title insurance", "title rate", "owner's policy", "lender's policy",
+         "simultaneous issue", "reissue rate", "basic manual",
+         "per thousand", "coverage amount", "loan policy"],
+        "title_rate",
+    ),
     (
         ["rate exhibit", "base rate", "rating factor", "rate table",
          "territory factor", "increased limit", "ilf table"],
@@ -101,11 +119,12 @@ _KEYWORD_RULES: list[tuple[list[str], str]] = [
 # ── Claude prompt ──────────────────────────────────────────────────────────
 
 _CLASSIFY_PROMPT = """\
-You are an expert in commercial insurance regulatory filings. Based on the \
+You are an expert in insurance regulatory filings. Based on the \
 following text from the first page of a SERFF filing document, classify it \
 into exactly one of these document types:
 
-  rate_exhibit    — rate tables, base rates, rating factors, ILF tables
+  title_rate      — title insurance rate schedules, owner/lender rates, simultaneous issue, reissue
+  rate_exhibit    — P&C rate tables, base rates, rating factors, ILF tables
   actuarial_memo  — actuarial memoranda, loss ratio analysis, trend analysis
   rule_manual     — underwriting rules, eligibility criteria, guidelines
   policy_form     — policy coverage forms, main policy wording
@@ -207,8 +226,10 @@ class DocumentClassifier:
 
     def _classify_by_filename(self, filename: str) -> str | None:
         """Return document type based on filename patterns, or None."""
+        # Normalize separators so \b word boundaries work across underscores/hyphens
+        normalized = filename.replace("_", " ").replace("-", " ")
         for pattern, doc_type in _FILENAME_PATTERNS:
-            if pattern.search(filename):
+            if pattern.search(normalized):
                 return doc_type
         return None
 

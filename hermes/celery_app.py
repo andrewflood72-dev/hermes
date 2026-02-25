@@ -109,6 +109,18 @@ app.conf.beat_schedule = {
         "schedule": crontab(minute=0),
         "options": {"queue": "default"},
     },
+    # 8. Title insurance SERFF scrape — 03:00 UTC daily (offset from P&C at 02:00)
+    "scrape-title-filings": {
+        "task": "hermes.tasks.scrape_title_filings",
+        "schedule": crontab(hour=3, minute=0),
+        "options": {"queue": "scraper"},
+    },
+    # 9. Parse title filing documents — every 4 hours at :30 (offset from P&C at :00)
+    "parse-title-filings": {
+        "task": "hermes.tasks.parse_title_filings",
+        "schedule": crontab(minute=30, hour="*/4"),
+        "options": {"queue": "parser"},
+    },
 }
 
 logger.info(

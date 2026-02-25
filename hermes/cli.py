@@ -988,6 +988,327 @@ def health() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Command: scrape-title
+# ---------------------------------------------------------------------------
+
+
+@app.command("scrape-title")
+def scrape_title(
+    state: str = typer.Option("TX", "--state", "-s", help="State code (default: TX)"),
+) -> None:
+    """Scrape title insurance rate filings from SERFF or state DOI.
+
+    For promulgated states (TX, NM), loads state-set rates directly.
+    For other states, runs SERFF title-specific search.
+
+    Examples:
+
+      hermes scrape-title --state TX
+
+      hermes scrape-title --state NY
+    """
+    console.print(
+        Panel(
+            f"[bold cyan]Hermes Title Insurance Scraper[/bold cyan]\n"
+            f"State: [yellow]{state.upper()}[/yellow]",
+            title="Title Scrape",
+            expand=False,
+        )
+    )
+
+    try:
+        from hermes.scraper.title_search import is_promulgated_state
+
+        state_upper = state.upper()
+
+        if is_promulgated_state(state_upper):
+            # Promulgated state — load directly
+            console.print(
+                f"[yellow]{state_upper} has promulgated title rates — loading directly[/yellow]"
+            )
+            if state_upper == "TX":
+                from hermes.scraper.tdi_scraper import load_tx_promulgated_rates
+
+                with console.status(f"[bold green]Loading {state_upper} promulgated rates...[/bold green]"):
+                    results = _run(load_tx_promulgated_rates())
+
+                table = Table(title=f"TX Promulgated Rates Loaded", box=box.ROUNDED)
+                table.add_column("Metric", style="cyan")
+                table.add_column("Value", style="green", justify="right")
+                table.add_row("Rate Cards Created", str(len(results)))
+                table.add_row("Source", "TDI Basic Manual")
+                console.print(table)
+            else:
+                console.print(f"[yellow]Promulgated rate loader for {state_upper} not yet implemented[/yellow]")
+        else:
+            # Non-promulgated — SERFF search
+            from hermes.scraper.title_search import build_title_search_params
+            from hermes.tasks import _get_scraper_for_state
+
+            params = build_title_search_params(state_upper)
+            if params is None:
+                err_console.print(f"No SERFF search available for {state_upper} title filings")
+                raise typer.Exit(1)
+
+            scraper = _get_scraper_for_state(state_upper)
+            if scraper is None:
+                err_console.print(f"No scraper implementation for state '{state_upper}'")
+                raise typer.Exit(1)
+
+            with console.status(f"[bold green]Scraping {state_upper} title filings...[/bold green]"):
+                result = _run(scraper.scrape(params))
+
+            table = Table(title="Title Scrape Results", box=box.ROUNDED)
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", style="green", justify="right")
+            table.add_row("State", state_upper)
+            table.add_row("Filings Found", str(result.filings_found))
+            table.add_row("Filings New", str(result.filings_new))
+            table.add_row("Documents Downloaded", str(result.documents_downloaded))
+            table.add_row("Duration", f"{result.duration_seconds:.1f}s")
+            console.print(table)
+
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        err_console.print(f"Title scrape failed: {exc}")
+        logger.exception("CLI scrape-title command failed")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Command: parse-title
+# ---------------------------------------------------------------------------
+
+
+@app.command("parse-title")
+def parse_title(
+    filing_id: Optional[str] = typer.Option(
+        None, "--filing-id", help="Parse a specific filing by UUID"
+    ),
+    state: Optional[str] = typer.Option(
+        None, "--state", help="Parse all unparsed title filings for a state"
+    ),
+) -> None:
+    """Parse title insurance rate exhibits from SERFF filing PDFs.
+
+    Examples:
+
+      hermes parse-title --filing-id 550e8400-e29b-41d4-a716-446655440000
+
+      hermes parse-title --state NY
+    """
+    console.print(
+        Panel(
+            f"[bold cyan]Hermes Title Rate Parser[/bold cyan]\n"
+            f"Filing ID: [yellow]{filing_id or 'all'}[/yellow]  "
+            f"State: [yellow]{state or 'all'}[/yellow]",
+            title="Title Parse",
+            expand=False,
+        )
+    )
+
+    try:
+        result = _run(_parse_title_async(filing_id, state))
+
+        table = Table(title="Title Parse Results", box=box.ROUNDED)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green", justify="right")
+        table.add_row("Documents Parsed", str(result["documents_parsed"]))
+        table.add_row("Documents Failed", str(result["documents_failed"]))
+        table.add_row("Errors", str(len(result.get("errors", []))))
+        console.print(table)
+
+        if result.get("errors"):
+            console.print("\n[bold red]Errors:[/bold red]")
+            for err in result["errors"][:5]:
+                console.print(f"  [red]- {err}[/red]")
+
+    except Exception as exc:
+        err_console.print(f"Title parse failed: {exc}")
+        logger.exception("CLI parse-title command failed")
+        raise typer.Exit(1)
+
+
+async def _parse_title_async(
+    filing_id: Optional[str],
+    state: Optional[str],
+) -> dict:
+    """Async backend for the parse-title CLI command."""
+    from hermes.parsers.title_parser import TitleParser
+    from hermes.db import async_session
+    from sqlalchemy import text
+
+    summary = {"documents_parsed": 0, "documents_failed": 0, "errors": []}
+
+    async with async_session() as session:
+        conditions = ["fd.parsed_flag = FALSE", "fd.file_path IS NOT NULL"]
+        params_dict: dict = {}
+
+        if filing_id:
+            conditions.append("fd.filing_id = :filing_id")
+            params_dict["filing_id"] = filing_id
+        if state:
+            conditions.append("f.state = :state")
+            params_dict["state"] = state.upper()
+
+        # Filter for title insurance filings
+        conditions.append("f.line_of_business ILIKE '%title%'")
+
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+        stmt = text(
+            f"""
+            SELECT fd.id, fd.file_path, fd.document_type
+            FROM hermes_filing_documents fd
+            JOIN hermes_filings f ON f.id = fd.filing_id
+            {where_clause}
+            ORDER BY fd.created_at ASC
+            LIMIT 100
+            """
+        )
+        result = await session.execute(stmt, params_dict)
+        docs = result.fetchall()
+
+    title_parser = TitleParser()
+
+    for doc in docs:
+        try:
+            parse_result = await title_parser.parse(doc.id, doc.file_path)
+            if parse_result.status in ("completed", "partial"):
+                async with async_session() as s:
+                    await s.execute(
+                        text(
+                            "UPDATE hermes_filing_documents SET parsed_flag=TRUE, "
+                            "parse_confidence=:conf, updated_at=NOW() WHERE id=:id"
+                        ),
+                        {"id": str(doc.id), "conf": parse_result.confidence_avg},
+                    )
+                    await s.commit()
+                summary["documents_parsed"] += 1
+            else:
+                summary["documents_failed"] += 1
+        except Exception as exc:
+            summary["errors"].append(f"doc={doc.id}: {exc}")
+            summary["documents_failed"] += 1
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Command: price-title
+# ---------------------------------------------------------------------------
+
+
+@app.command("price-title")
+def price_title(
+    purchase_price: float = typer.Option(..., "--purchase-price", "-p", help="Purchase price in USD"),
+    loan_amount: float = typer.Option(0, "--loan-amount", "-l", help="Loan amount in USD"),
+    state: str = typer.Option("TX", "--state", "-s", help="State code"),
+    refinance: bool = typer.Option(False, "--refinance", is_flag=True, help="Refinance transaction"),
+    years_since: Optional[float] = typer.Option(None, "--years-since", help="Years since prior policy"),
+) -> None:
+    """Run a title insurance multi-carrier quote.
+
+    Examples:
+
+      hermes price-title --purchase-price 400000 --loan-amount 380000 --state TX
+
+      hermes price-title -p 250000 -l 200000 -s NY
+
+      hermes price-title -p 500000 -l 475000 -s TX --refinance --years-since 3
+    """
+    console.print(
+        Panel(
+            f"[bold cyan]Hermes Title Insurance Pricer[/bold cyan]\n"
+            f"Purchase: [yellow]${purchase_price:,.0f}[/yellow]  "
+            f"Loan: [yellow]${loan_amount:,.0f}[/yellow]  "
+            f"State: [yellow]{state.upper()}[/yellow]",
+            title="Title Quote",
+            expand=False,
+        )
+    )
+
+    try:
+        from hermes.title.engine import HermesTitleEngine
+        from hermes.title.schemas import TitleQuoteRequest
+
+        policy_type = "simultaneous" if loan_amount > 0 else "owner"
+        request = TitleQuoteRequest(
+            purchase_price=purchase_price,
+            loan_amount=loan_amount,
+            state=state.upper(),
+            policy_type=policy_type,
+            is_refinance=refinance,
+            years_since_prior_policy=years_since,
+        )
+
+        with console.status("[bold green]Running title quote...[/bold green]"):
+            response = _run(_price_title_async(request))
+
+        if not response.quotes:
+            console.print("[yellow]No carriers returned quotes. Check that rate cards are loaded.[/yellow]")
+            console.print("[dim]Hint: Run 'hermes scrape-title --state TX' to load TX promulgated rates.[/dim]")
+            return
+
+        table = Table(
+            title=f"Title Insurance Quotes — {state.upper()} | ${purchase_price:,.0f} / ${loan_amount:,.0f}",
+            box=box.ROUNDED,
+        )
+        table.add_column("Rank", style="dim", width=5)
+        table.add_column("Carrier", style="cyan")
+        table.add_column("Owner", justify="right", width=10)
+        table.add_column("Lender", justify="right", width=10)
+        table.add_column("Simul. Total", justify="right", width=12)
+        table.add_column("Savings", justify="right", width=10, style="green")
+        table.add_column("Total", justify="right", width=12, style="bold")
+        table.add_column("Promulgated", width=11)
+
+        for i, q in enumerate(response.quotes, 1):
+            table.add_row(
+                str(i),
+                q.carrier_name[:30],
+                f"${q.owner_premium:,.0f}",
+                f"${q.lender_premium:,.0f}",
+                f"${q.simultaneous_premium:,.0f}" if q.simultaneous_premium > 0 else "—",
+                f"${q.simultaneous_savings:,.0f}" if q.simultaneous_savings > 0 else "—",
+                f"${q.total_premium:,.0f}",
+                "[green]Yes[/green]" if q.is_promulgated else "No",
+            )
+
+        console.print(table)
+
+        # Summary
+        console.print(f"\n  Carriers quoted: {response.carriers_quoted}")
+        console.print(f"  Processing time: {response.processing_time_ms:.1f}ms")
+        if response.best_total:
+            console.print(
+                f"  [bold green]Best total: ${response.best_total.total_premium:,.0f} "
+                f"({response.best_total.carrier_name})[/bold green]"
+            )
+        if response.best_simultaneous_savings:
+            console.print(
+                f"  [bold cyan]Max simul. savings: ${response.best_simultaneous_savings.simultaneous_savings:,.0f} "
+                f"({response.best_simultaneous_savings.carrier_name})[/bold cyan]"
+            )
+
+    except Exception as exc:
+        err_console.print(f"Title pricing failed: {exc}")
+        logger.exception("CLI price-title command failed")
+        raise typer.Exit(1)
+
+
+async def _price_title_async(request):
+    """Async backend for the price-title CLI command."""
+    from hermes.title.engine import HermesTitleEngine
+    engine = HermesTitleEngine()
+    try:
+        return await engine.price_policy(request)
+    finally:
+        await engine.close()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
