@@ -42,6 +42,9 @@ from hermes.api.schemas import (
     RateComparisonEntry,
     RateComparisonResponse,
     RiskProfileInput,
+    TitleCarrierMatchResponse,
+    TitleMatchResponse,
+    TitleRiskInput,
 )
 from hermes.config import settings
 from hermes.matching.engine import CarrierMatchResult, MatchingEngine
@@ -128,6 +131,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _title_engine = HermesTitleEngine(db_engine=_engine)
     set_title_engine(_title_engine)
     set_title_db_engine(_engine)
+    _matching_engine.set_title_engine(_title_engine)
     logger.info("HermesTitleEngine ready")
 
     _mga_agent = MGAProposalAgent(
@@ -414,6 +418,80 @@ async def match_risk(
         carriers_evaluated=len(all_matches),
         carriers_eligible=sum(1 for m in all_matches if m.eligibility.status != "fail"),
         match_time_ms=elapsed_ms,
+    )
+
+
+@app.post(
+    "/v1/match/title",
+    response_model=TitleMatchResponse,
+    summary="Run title carrier matching",
+    tags=["Matching"],
+)
+async def match_title_risk(
+    body: TitleRiskInput,
+    _key: str = Depends(require_api_key),
+) -> TitleMatchResponse:
+    """Match a title insurance risk against all eligible title carriers for the
+    requested state.
+
+    Returns a ranked list of carriers with eligibility, appetite, premium
+    breakdown (owner/lender/simultaneous/savings), and placement probability.
+    """
+    engine = _get_matching_engine()
+    t0 = time.monotonic()
+
+    risk_dict = body.model_dump()
+
+    all_matches = await engine.match_title(
+        risk_profile=risk_dict,
+        state=body.state.upper(),
+    )
+
+    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+
+    match_responses: list[TitleCarrierMatchResponse] = []
+    for m in all_matches:
+        notes = list(m.eligibility.failed_criteria) + list(m.eligibility.conditional_notes)
+        components = m.premium.components or {}
+        match_responses.append(
+            TitleCarrierMatchResponse(
+                carrier_id=m.carrier_id,
+                carrier_name=m.carrier_name,
+                naic_code=m.naic_code,
+                am_best_rating=None,
+                eligibility_status=m.eligibility.status,
+                eligibility_notes=notes,
+                appetite_score=m.appetite.score,
+                competitiveness_rank=m.competitiveness_rank,
+                placement_probability=m.placement_probability,
+                owner_premium=float(components.get("owner_premium", 0)),
+                lender_premium=float(components.get("lender_premium", 0)),
+                simultaneous_premium=float(components.get("simultaneous_premium", 0)),
+                simultaneous_savings=float(components.get("simultaneous_savings", 0)),
+                simultaneous_discount_pct=float(components.get("simultaneous_discount_pct", 0)),
+                reissue_credit=float(components.get("reissue_credit", 0)),
+                endorsement_fees=float(components.get("endorsement_fees", 0)),
+                total_premium=m.premium.final_estimated,
+                is_promulgated=bool(components.get("is_promulgated", False)),
+            )
+        )
+
+    best_total = min((r.total_premium for r in match_responses), default=None) if match_responses else None
+    best_savings = max(
+        (r.simultaneous_savings for r in match_responses), default=None
+    ) if match_responses else None
+
+    return TitleMatchResponse(
+        matches=match_responses,
+        state=body.state.upper(),
+        purchase_price=body.purchase_price,
+        loan_amount=body.loan_amount,
+        policy_type=body.policy_type,
+        carriers_evaluated=len(all_matches),
+        carriers_eligible=sum(1 for m in all_matches if m.eligibility.status != "fail"),
+        match_time_ms=elapsed_ms,
+        best_total=best_total,
+        best_simultaneous_savings=best_savings if best_savings and best_savings > 0 else None,
     )
 
 

@@ -315,6 +315,125 @@ class MarketIntelResponse(BaseModel):
     top_signals: list[dict] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Title matching schemas
+# ---------------------------------------------------------------------------
+
+
+class TitleRiskInput(BaseModel):
+    """Inbound title risk profile submitted to the /v1/match/title endpoint.
+
+    Attributes
+    ----------
+    purchase_price:
+        Property purchase price in USD.
+    loan_amount:
+        Mortgage loan amount.  0 for a cash purchase (no lender policy).
+    state:
+        Two-letter state code.
+    policy_type:
+        ``"owner"`` | ``"lender"`` | ``"simultaneous"`` (default).
+    is_refinance:
+        Whether this is a refinance transaction.
+    years_since_prior_policy:
+        Years since the prior policy (for reissue credit calculation).
+    endorsements:
+        List of ALTA endorsement codes requested.
+    property_type:
+        ``"residential"`` | ``"commercial"`` | ``"vacant_land"`` (informational).
+    transaction_type:
+        ``"purchase"`` | ``"refinance"`` | ``"construction"`` (informational).
+    """
+
+    purchase_price: float = Field(..., gt=0, description="Purchase price in USD")
+    loan_amount: float = Field(default=0, ge=0, description="Loan amount (0 = cash purchase)")
+    state: str = Field(..., min_length=2, max_length=2, description="Two-letter state code")
+    policy_type: str = Field(
+        default="simultaneous",
+        description='Policy type: "owner", "lender", or "simultaneous"',
+    )
+    is_refinance: bool = Field(default=False, description="Refinance transaction flag")
+    years_since_prior_policy: float | None = Field(
+        default=None, ge=0, description="Years since prior policy (for reissue credit)"
+    )
+    endorsements: list[str] = Field(
+        default_factory=list, description="ALTA endorsement codes requested"
+    )
+    property_type: str | None = Field(
+        default=None,
+        description='Property type: "residential", "commercial", "vacant_land"',
+    )
+    transaction_type: str | None = Field(
+        default=None,
+        description='Transaction type: "purchase", "refinance", "construction"',
+    )
+
+
+class TitleCarrierMatchResponse(BaseModel):
+    """Single title carrier result within a :class:`TitleMatchResponse`.
+
+    Includes all base matching fields plus title-specific premium breakdown.
+    """
+
+    carrier_id: UUID
+    carrier_name: str
+    naic_code: str
+    am_best_rating: str | None = None
+    eligibility_status: str
+    eligibility_notes: list[str] = Field(default_factory=list)
+    appetite_score: float
+    competitiveness_rank: int
+    placement_probability: float
+    owner_premium: float = 0.0
+    lender_premium: float = 0.0
+    simultaneous_premium: float = 0.0
+    simultaneous_savings: float = 0.0
+    simultaneous_discount_pct: float = 0.0
+    reissue_credit: float = 0.0
+    endorsement_fees: float = 0.0
+    total_premium: float = 0.0
+    is_promulgated: bool = False
+
+
+class TitleMatchResponse(BaseModel):
+    """Response envelope for POST /v1/match/title.
+
+    Attributes
+    ----------
+    matches:
+        Ranked list of title carrier matches.
+    state:
+        State evaluated.
+    purchase_price:
+        Purchase price from the request.
+    loan_amount:
+        Loan amount from the request.
+    policy_type:
+        Policy type from the request.
+    carriers_evaluated:
+        Total carriers evaluated.
+    carriers_eligible:
+        Carriers that passed eligibility.
+    match_time_ms:
+        Wall-clock time in milliseconds.
+    best_total:
+        Lowest total premium across all carriers.
+    best_simultaneous_savings:
+        Highest simultaneous savings across all carriers.
+    """
+
+    matches: list[TitleCarrierMatchResponse]
+    state: str
+    purchase_price: float
+    loan_amount: float
+    policy_type: str
+    carriers_evaluated: int
+    carriers_eligible: int
+    match_time_ms: float
+    best_total: float | None = None
+    best_simultaneous_savings: float | None = None
+
+
 class HealthResponse(BaseModel):
     """Response for GET /v1/health.
 

@@ -1298,6 +1298,142 @@ def price_title(
         raise typer.Exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Command: match-title
+# ---------------------------------------------------------------------------
+
+
+@app.command("match-title")
+def match_title(
+    purchase_price: float = typer.Option(..., "--purchase-price", "-p", help="Purchase price in USD"),
+    loan_amount: float = typer.Option(0, "--loan-amount", "-l", help="Loan amount in USD"),
+    state: str = typer.Option(..., "--state", "-s", help="State code (e.g. TX, CA)"),
+    policy_type: Optional[str] = typer.Option(None, "--policy-type", help='Policy type: owner/lender/simultaneous'),
+    refinance: bool = typer.Option(False, "--refinance", is_flag=True, help="Refinance transaction"),
+    years_since: Optional[float] = typer.Option(None, "--years-since", help="Years since prior policy"),
+) -> None:
+    """Run title carrier matching for a title insurance risk.
+
+    Matches a title insurance risk through the Hermes matching pipeline
+    (eligibility → appetite → premium → ranking) and displays ranked results.
+
+    Examples:
+
+      hermes match-title --purchase-price 400000 --loan-amount 380000 --state TX
+
+      hermes match-title -p 250000 -l 200000 -s NY --policy-type simultaneous
+
+      hermes match-title -p 500000 -s TX --refinance --years-since 3
+    """
+    effective_policy_type = policy_type or ("simultaneous" if loan_amount > 0 else "owner")
+
+    console.print(
+        Panel(
+            f"[bold cyan]Hermes Title Carrier Matcher[/bold cyan]\n"
+            f"Purchase: [yellow]${purchase_price:,.0f}[/yellow]  "
+            f"Loan: [yellow]${loan_amount:,.0f}[/yellow]  "
+            f"State: [yellow]{state.upper()}[/yellow]  "
+            f"Type: [yellow]{effective_policy_type}[/yellow]",
+            title="Title Match",
+            expand=False,
+        )
+    )
+
+    try:
+        risk_profile = {
+            "purchase_price": purchase_price,
+            "loan_amount": loan_amount,
+            "state": state.upper(),
+            "policy_type": effective_policy_type,
+            "is_refinance": refinance,
+            "years_since_prior_policy": years_since,
+            "endorsements": [],
+        }
+
+        with console.status("[bold green]Running title carrier matching...[/bold green]"):
+            matches = _run(_match_title_async(risk_profile, state.upper()))
+
+        if not matches:
+            console.print("[yellow]No title carriers found for this state.[/yellow]")
+            console.print("[dim]Hint: Run 'hermes scrape-title --state TX' to load rate cards.[/dim]")
+            return
+
+        table = Table(
+            title=f"Title Carrier Matches — {state.upper()} | ${purchase_price:,.0f} / ${loan_amount:,.0f}",
+            box=box.ROUNDED,
+        )
+        table.add_column("Rank", style="dim", width=5)
+        table.add_column("Carrier", style="cyan")
+        table.add_column("Appetite", justify="right", width=9)
+        table.add_column("Owner", justify="right", width=10)
+        table.add_column("Lender", justify="right", width=10)
+        table.add_column("Simul.", justify="right", width=10)
+        table.add_column("Savings", justify="right", width=10, style="green")
+        table.add_column("Total", justify="right", width=12, style="bold")
+        table.add_column("Prob.", justify="right", width=7)
+
+        for m in matches[:20]:
+            components = m.premium.components or {}
+            owner = float(components.get("owner_premium", 0))
+            lender = float(components.get("lender_premium", 0))
+            simul = float(components.get("simultaneous_premium", 0))
+            savings = float(components.get("simultaneous_savings", 0))
+            total = m.premium.final_estimated
+
+            table.add_row(
+                str(m.competitiveness_rank),
+                m.carrier_name[:30],
+                f"{m.appetite.score:.0f}",
+                f"${owner:,.0f}" if owner > 0 else "—",
+                f"${lender:,.0f}" if lender > 0 else "—",
+                f"${simul:,.0f}" if simul > 0 else "—",
+                f"${savings:,.0f}" if savings > 0 else "—",
+                f"${total:,.0f}" if total > 0 else "—",
+                f"{m.placement_probability:.0%}",
+            )
+
+        console.print(table)
+
+        # Summary
+        eligible_count = sum(1 for m in matches if m.eligibility.status != "fail")
+        console.print(f"\n  Carriers evaluated: {len(matches)}")
+        console.print(f"  Carriers eligible: {eligible_count}")
+        if matches:
+            best = min(matches, key=lambda m: m.premium.final_estimated if m.premium.final_estimated > 0 else float("inf"))
+            if best.premium.final_estimated > 0:
+                console.print(
+                    f"  [bold green]Best total: ${best.premium.final_estimated:,.0f} "
+                    f"({best.carrier_name})[/bold green]"
+                )
+            best_savings = max(matches, key=lambda m: float(m.premium.components.get("simultaneous_savings", 0)) if m.premium.components else 0)
+            s = float(best_savings.premium.components.get("simultaneous_savings", 0)) if best_savings.premium.components else 0
+            if s > 0:
+                console.print(
+                    f"  [bold cyan]Max simul. savings: ${s:,.0f} "
+                    f"({best_savings.carrier_name})[/bold cyan]"
+                )
+
+    except Exception as exc:
+        err_console.print(f"Title matching failed: {exc}")
+        logger.exception("CLI match-title command failed")
+        raise typer.Exit(1)
+
+
+async def _match_title_async(risk_profile: dict, state: str):
+    """Async backend for the match-title CLI command."""
+    from hermes.matching.engine import MatchingEngine
+    from hermes.title.engine import HermesTitleEngine
+
+    title_engine = HermesTitleEngine()
+    matching_engine = MatchingEngine()
+    matching_engine.set_title_engine(title_engine)
+    try:
+        return await matching_engine.match_title(risk_profile, state)
+    finally:
+        await title_engine.close()
+        await matching_engine.close()
+
+
 async def _price_title_async(request):
     """Async backend for the price-title CLI command."""
     from hermes.title.engine import HermesTitleEngine

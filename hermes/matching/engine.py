@@ -24,6 +24,8 @@ from hermes.matching.eligibility import EligibilityFilter, EligibilityResult
 from hermes.matching.appetite import AppetiteScorer, AppetiteResult
 from hermes.matching.premium import PremiumEstimator, PremiumEstimate
 from hermes.matching.ranker import CarrierRanker
+from hermes.matching.title_eligibility import TitleEligibilityFilter
+from hermes.matching.title_appetite import TitleAppetiteScorer
 
 logger = logging.getLogger("hermes.matching.engine")
 
@@ -111,6 +113,9 @@ class MatchingEngine:
         self.appetite_scorer = AppetiteScorer(engine=db_engine)
         self.premium_estimator = PremiumEstimator(engine=db_engine)
         self.ranker = CarrierRanker()
+        self.title_eligibility = TitleEligibilityFilter(engine=db_engine)
+        self.title_appetite = TitleAppetiteScorer(engine=db_engine)
+        self._title_engine: Any | None = None
         logger.info("MatchingEngine initialised")
 
     # ------------------------------------------------------------------
@@ -130,6 +135,8 @@ class MatchingEngine:
             self.eligibility_filter._engine = self._engine
             self.appetite_scorer._engine = self._engine
             self.premium_estimator._engine = self._engine
+            self.title_eligibility._engine = self._engine
+            self.title_appetite._engine = self._engine
         return self._engine
 
     async def close(self) -> None:
@@ -137,6 +144,198 @@ class MatchingEngine:
         if self._engine is not None:
             await self._engine.dispose()
             logger.info("MatchingEngine database engine disposed")
+
+    def set_title_engine(self, title_engine: Any) -> None:
+        """Attach a :class:`HermesTitleEngine` for title premium computation."""
+        self._title_engine = title_engine
+        logger.info("Title engine attached to MatchingEngine")
+
+    # ------------------------------------------------------------------
+    # Title matching API
+    # ------------------------------------------------------------------
+
+    async def match_title(
+        self,
+        risk_profile: dict,
+        state: str,
+    ) -> list[CarrierMatchResult]:
+        """Run the title-specific matching pipeline.
+
+        1. Discover carriers with active title rate cards for *state*.
+        2. For each carrier: eligibility → appetite → premium (via HermesTitleEngine).
+        3. Filter failures, rank, and return sorted results.
+
+        Parameters
+        ----------
+        risk_profile:
+            Title risk attributes (purchase_price, loan_amount, policy_type, etc.).
+        state:
+            Two-letter state code.
+
+        Returns
+        -------
+        list[CarrierMatchResult]
+            Ranked title carrier matches.
+        """
+        await self._get_engine()
+        carriers = await self._get_active_title_carriers(state)
+        logger.info(
+            "Found %d active title carriers for state=%s", len(carriers), state,
+        )
+
+        if not carriers:
+            return []
+
+        tasks = [
+            self._evaluate_title_carrier(carrier, state, risk_profile)
+            for carrier in carriers
+        ]
+        results: list[CarrierMatchResult | None] = await asyncio.gather(
+            *tasks, return_exceptions=False
+        )
+
+        eligible = []
+        for result in results:
+            if result is None:
+                continue
+            if result.eligibility.status == "fail":
+                logger.debug(
+                    "Title carrier %s failed eligibility for %s; excluded",
+                    result.carrier_name, state,
+                )
+                continue
+            eligible.append(result)
+
+        ranked = self.ranker.rank_carriers(eligible)
+        logger.info(
+            "Title matching complete: %d eligible carriers for state=%s",
+            len(ranked), state,
+        )
+        return ranked
+
+    async def _evaluate_title_carrier(
+        self,
+        carrier: dict,
+        state: str,
+        risk_profile: dict,
+    ) -> CarrierMatchResult | None:
+        """Run the title evaluation pipeline for a single carrier."""
+        carrier_id = UUID(str(carrier["id"]))
+        carrier_name: str = carrier.get("legal_name", "Unknown")
+        naic_code: str = carrier.get("naic_code", "")
+
+        try:
+            # Stage 1: Title eligibility
+            eligibility = await self.title_eligibility.check_eligibility(
+                carrier_id=carrier_id,
+                state=state,
+                risk_profile=risk_profile,
+            )
+
+            # Stage 2: Title appetite
+            appetite = await self.title_appetite.score_appetite(
+                carrier_id=carrier_id,
+                state=state,
+                risk_profile=risk_profile,
+            )
+
+            # Stage 3: Premium via HermesTitleEngine
+            premium = PremiumEstimate(notes=["Title premium not available."])
+            if eligibility.status != "fail" and self._title_engine is not None:
+                premium = await self._compute_title_premium(
+                    carrier_id, state, risk_profile
+                )
+
+            return CarrierMatchResult(
+                carrier_id=carrier_id,
+                carrier_name=carrier_name,
+                naic_code=naic_code,
+                state=state,
+                line="Title",
+                eligibility=eligibility,
+                appetite=appetite,
+                premium=premium,
+                coverage_highlights=[],
+                recent_signals=[],
+                filing_references=[],
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Error evaluating title carrier=%s state=%s: %s",
+                carrier_name, state, exc,
+            )
+            return None
+
+    async def _compute_title_premium(
+        self,
+        carrier_id: UUID,
+        state: str,
+        risk_profile: dict,
+    ) -> PremiumEstimate:
+        """Use the attached HermesTitleEngine to price a single carrier."""
+        from hermes.title.schemas import TitleQuoteRequest
+
+        request = TitleQuoteRequest(
+            purchase_price=risk_profile.get("purchase_price", 0),
+            loan_amount=risk_profile.get("loan_amount", 0),
+            state=state,
+            policy_type=risk_profile.get("policy_type", "simultaneous"),
+            is_refinance=risk_profile.get("is_refinance", False),
+            years_since_prior_policy=risk_profile.get("years_since_prior_policy"),
+            endorsements=risk_profile.get("endorsements", []),
+            carrier_ids=[carrier_id],
+        )
+
+        response = await self._title_engine.price_policy(request)
+
+        if not response.quotes:
+            return PremiumEstimate(
+                notes=["No quote returned from title engine."],
+                confidence=0.0,
+            )
+
+        quote = response.quotes[0]
+        return PremiumEstimate(
+            final_estimated=quote.total_premium,
+            confidence=1.0,
+            components={
+                "owner_premium": quote.owner_premium,
+                "lender_premium": quote.lender_premium,
+                "simultaneous_premium": quote.simultaneous_premium,
+                "simultaneous_savings": quote.simultaneous_savings,
+                "simultaneous_discount_pct": quote.simultaneous_discount_pct,
+                "reissue_credit": quote.reissue_credit,
+                "endorsement_fees": quote.endorsement_fees,
+                "total_premium": quote.total_premium,
+                "is_promulgated": quote.is_promulgated,
+            },
+            notes=[],
+        )
+
+    async def _get_active_title_carriers(self, state: str) -> list[dict]:
+        """Return carriers with current title rate cards for this state."""
+        query = text(
+            """
+            SELECT DISTINCT
+                c.id,
+                c.naic_code,
+                c.legal_name,
+                c.am_best_rating
+            FROM hermes_carriers c
+            JOIN hermes_title_rate_cards rc ON rc.carrier_id = c.id
+            WHERE
+                rc.state = :state
+                AND rc.is_current = TRUE
+                AND c.status = 'active'
+            ORDER BY c.legal_name
+            """
+        )
+        engine = await self._get_engine()
+        async with engine.connect() as conn:
+            result = await conn.execute(query, {"state": state})
+            rows = result.mappings().all()
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Primary matching API
